@@ -561,9 +561,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
   /tmp/requirements-cuda.txt && \
   # xgrammar is installed from the wheel built in xgrammar-builder (below);
   # pin opencv to the ppc64le DevPI build. numpy/pillow resolve from DevPI.
+  # transformers is only ">= 5.15.1" upstream, so pin the version this image was validated with
+  # (2026-11-05). 5.18+ blocks Gemma4's global head_dim (run with --hf-overrides, see CLAUDE.md).
   sed -i \
   -e '/^xgrammar/d' \
   -e 's/^opencv-python-headless.*/opencv-python-headless == 4.13.0.92/' \
+  -e 's/^transformers .*/transformers == 5.22.1/' \
   /tmp/common.txt && \
   uv pip install --system -r /tmp/requirements-cuda.txt && \
   # timm: required by vision models (e.g. Gemma 3n) for vision tower components
