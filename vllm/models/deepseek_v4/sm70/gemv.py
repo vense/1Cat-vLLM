@@ -414,23 +414,28 @@ def _has_sm70_dsv4_gemv_contract(
     weight: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> bool:
+    # Static weight checks come first: GateLinear calls this for every MoE
+    # router inside torch.compile, where the platform query below is not
+    # traceable by Dynamo and a batch-size comparison would add a shape guard.
+    # Routers that cannot match the DeepSeek-V4 shapes (e.g. Gemma4) must
+    # short-circuit before reaching either.
     return (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
+        weight.ndim == 2
+        and weight.shape[0] in _SUPPORTED_N
+        and weight.shape[1] == _K
+        and weight.dtype == torch.float16
+        and output_dtype in (torch.float16, torch.float32)
+        and (output_dtype == torch.float32 or weight.shape[0] == 64)
         and x.is_cuda
         and weight.is_cuda
         and x.device == weight.device
         and x.dtype == torch.float16
-        and weight.dtype == torch.float16
-        and output_dtype in (torch.float16, torch.float32)
         and x.ndim == 2
         and x.shape == (1, _K)
-        and weight.ndim == 2
-        and weight.shape[0] in _SUPPORTED_N
-        and weight.shape[1] == _K
-        and (output_dtype == torch.float32 or weight.shape[0] == 64)
         and x.is_contiguous()
         and weight.is_contiguous()
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
     )
 
 
