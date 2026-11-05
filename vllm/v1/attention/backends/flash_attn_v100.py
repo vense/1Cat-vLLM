@@ -1611,13 +1611,6 @@ def _should_use_prefill_d256_gqa_architecture(
             _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
             and max_seqlen_q <= max_seqlen_k <= 262144
             and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
-            # Q8001..Q8191 goes to the Q8192 op, which needs KV >= 8192. A first
-            # chunk of Q8160/KV8160 (budget 8192 minus concurrent decode tokens)
-            # otherwise crashes the engine (ppc64le build, 2026-11-05).
-            and (
-                max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
-                or max_seqlen_k >= _SM70_79T_MAX_QUERY_LEN
-            )
         )
     return (
         envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
