@@ -27,6 +27,33 @@ class ModelArchConfigConvertorBase:
         self.hf_config = hf_config
         self.hf_text_config = hf_text_config
 
+    def get_per_layer_hf_configs(
+        self,
+    ) -> list[tuple[PretrainedConfig, PretrainedConfig]] | None:
+        """`(hf_config, hf_text_config)` per layer, or `None` if homogeneous.
+
+        Transformers 5.18+ marks configs whose layers differ (for example Gemma4
+        sliding vs full attention head sizes) as heterogeneous and refuses global
+        reads of the varying attributes. This is the only place that decides
+        whether a checkpoint is heterogeneous and how many layers it has.
+        """
+        config_het = getattr(self.hf_config, "is_heterogeneous", False)
+        text_het = getattr(self.hf_text_config, "is_heterogeneous", False)
+        if not (config_het or text_het):
+            return None
+        # The text config decides the layer count when it is the heterogeneous one:
+        # its stack is what vLLM builds attention layers for.
+        source = self.hf_text_config if text_het else self.hf_config
+        return [
+            (
+                self.hf_config.per_layer_config[i] if config_het else self.hf_config,
+                self.hf_text_config.per_layer_config[i]
+                if text_het
+                else self.hf_text_config,
+            )
+            for i in range(len(source.per_layer_config))
+        ]
+
     def get_architectures(self) -> list[str]:
         # Sometimes we get here from `vllm_config.with_hf_config(text_config)` where
         # `text_config` is a sub-config from a multi-modal model. If this is the case,
@@ -313,6 +340,24 @@ class ModelArchConfigConvertorBase:
         return derived_max_model_len, max_len_key
 
     def convert(self) -> ModelArchitectureConfig:
+        if (per_layer := self.get_per_layer_hf_configs()) is None:
+            return self.convert_layer()
+
+        if self.is_deepseek_mla():
+            raise NotImplementedError(
+                "Heterogeneous MLA models are not supported: `get_head_size` "
+                "patches the config in place for them, which a per-layer "
+                "conversion would apply to a throwaway copy."
+            )
+        # Convert each layer and let the result work out which fields differ.
+        # Reading a varying attribute off the global config would raise, so the
+        # whole-model config has to be built up from the layers.
+        return ModelArchitectureConfig.from_layers(
+            [type(self)(*configs).convert_layer() for configs in per_layer]
+        )
+
+    def convert_layer(self) -> ModelArchitectureConfig:
+        """Convert one homogeneous config, without resolving per-layer values."""
         model_arch_config = ModelArchitectureConfig(
             architectures=self.get_architectures(),
             model_type=self.hf_config.model_type,

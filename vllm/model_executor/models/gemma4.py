@@ -559,10 +559,6 @@ class Gemma4DecoderLayer(nn.Module):
         # Gemma4 uses different head dimensions for sliding vs full attention
         layer_type = config.layer_types[layer_idx]
         self.is_full_attention = layer_type == "full_attention"
-        if self.is_full_attention:
-            head_dim = getattr(config, "global_head_dim", config.head_dim)
-        else:
-            head_dim = config.head_dim
 
         # Determine if this full-attention layer uses k_eq_v
         # (laptop variant: no v_proj, K reused as V on full attention layers)
@@ -570,14 +566,26 @@ class Gemma4DecoderLayer(nn.Module):
             config, "attention_k_eq_v", False
         )
 
-        # For k_eq_v full-attention layers, use num_global_key_value_heads
-        # as the KV head count when k_eq_v is enabled.
-        if use_k_eq_v:
-            num_kv_heads = getattr(
-                config, "num_global_key_value_heads", config.num_key_value_heads
-            )
+        if getattr(config, "is_heterogeneous", False):
+            # Transformers 5.18+ resolves global_head_dim and
+            # num_global_key_value_heads into the per-layer configs and refuses
+            # global reads of head_dim / num_key_value_heads.
+            layer_config = config.per_layer_config[layer_idx]
+            head_dim = layer_config.head_dim
+            num_kv_heads = layer_config.num_key_value_heads
         else:
-            num_kv_heads = config.num_key_value_heads
+            if self.is_full_attention:
+                head_dim = getattr(config, "global_head_dim", config.head_dim)
+            else:
+                head_dim = config.head_dim
+            # For k_eq_v full-attention layers, use num_global_key_value_heads
+            # as the KV head count when k_eq_v is enabled.
+            if use_k_eq_v:
+                num_kv_heads = getattr(
+                    config, "num_global_key_value_heads", config.num_key_value_heads
+                )
+            else:
+                num_kv_heads = config.num_key_value_heads
 
         self.self_attn = Gemma4Attention(
             config=config,

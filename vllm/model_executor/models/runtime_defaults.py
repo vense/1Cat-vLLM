@@ -294,12 +294,16 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
             and cfg.model_config is not None
             and "VLLM_FLASH_V100_BFLA_KEEP_RATIO" not in defaults
         ):
+            from vllm.transformers_utils.config import get_uniform_config_attr
+
             hf_text_config = cfg.model_config.hf_text_config
-            num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
-            num_key_value_heads = getattr(
+            num_attention_heads = get_uniform_config_attr(
+                hf_text_config, "num_attention_heads"
+            )
+            num_key_value_heads = get_uniform_config_attr(
                 hf_text_config, "num_key_value_heads", num_attention_heads
             )
-            head_dim = getattr(hf_text_config, "head_dim", None)
+            head_dim = get_uniform_config_attr(hf_text_config, "head_dim")
             if (
                 num_attention_heads == 24
                 and num_key_value_heads == 4

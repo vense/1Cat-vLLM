@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_uniform_config_attr
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -254,21 +255,24 @@ class Gemma4Config(VerifyAndUpdateConfig):
         require NixlConnector changes to support per-layer KV transfer
         with different head dimensions for prefill-decode disaggregation.
         """
-        hf_text_config = vllm_config.model_config.hf_text_config
-        head_dim = getattr(hf_text_config, "head_dim", None)
-        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        model_config = vllm_config.model_config
+        # Per-layer sizes come from the arch config, which also covers
+        # transformers 5.18+ heterogeneous configs (global_head_dim is resolved
+        # into per_layer_config there and global reads of head_dim raise).
+        arch_config = model_config.model_arch_config
+        layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
+        head_dims = {
+            arch_config[i].head_size
+            for i in range(min(arch_config.total_num_hidden_layers, len(layer_types)))
+        }
 
         # Only force Triton when head dimensions actually differ AND the
         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).
         # This avoids unnecessary backend forcing on smaller models where
-        # the config carries global_head_dim but all layers can still use
-        # the same FA backend.
-        max_head_dim = max(head_dim or 0, global_head_dim or 0)
+        # all layers can still use the same FA backend.
         if (
-            head_dim is not None
-            and global_head_dim is not None
-            and head_dim != global_head_dim
-            and max_head_dim > 256
+            len(head_dims) > 1
+            and max(head_dims) > 256
             and vllm_config.attention_config.backend is None
         ):
             from vllm.v1.attention.backends.registry import (
@@ -277,11 +281,10 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
             vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
-                "Gemma4 model has heterogeneous head dimensions "
-                "(head_dim=%d, global_head_dim=%d). Forcing TRITON_ATTN "
-                "backend to prevent mixed-backend numerical divergence.",
-                head_dim,
-                global_head_dim,
+                "Gemma4 model has heterogeneous head dimensions %s. Forcing "
+                "TRITON_ATTN backend to prevent mixed-backend numerical "
+                "divergence.",
+                sorted(head_dims),
             )
 
 
@@ -933,8 +936,8 @@ def sm70_dflash2_verifier_qualified(
         and getattr(model_config, "dtype", None) == torch.float16
         and getattr(hf_text_config, "hidden_size", None) == 5120
         and getattr(hf_text_config, "num_attention_heads", None) == 24
-        and getattr(hf_text_config, "num_key_value_heads", None) == 4
-        and getattr(hf_text_config, "head_dim", None) == 256
+        and get_uniform_config_attr(hf_text_config, "num_key_value_heads") == 4
+        and get_uniform_config_attr(hf_text_config, "head_dim") == 256
         and getattr(speculative_config, "method", None) == "dflash"
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
         and selector_top_k == 16
