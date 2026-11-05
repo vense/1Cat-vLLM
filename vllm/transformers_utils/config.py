@@ -158,6 +158,20 @@ _AUTO_CONFIG_KWARGS_OVERRIDES: dict[str, dict[str, Any]] = {
 }
 
 
+def get_uniform_config_attr(config: Any, name: str, default: Any = None) -> Any:
+    """`getattr(config, name, default)` that also works on heterogeneous configs.
+
+    Transformers 5.18+ resolves attributes that differ per layer (for example
+    Gemma4's sliding/full attention head_dim) into `per_layer_config` and raises
+    on global reads of them. Returns the shared value when every layer agrees,
+    and `default` when the attribute is missing or varies by layer.
+    """
+    if not getattr(config, "is_heterogeneous", False):
+        return getattr(config, name, default)
+    values = {getattr(layer, name, default) for layer in config.per_layer_config}
+    return values.pop() if len(values) == 1 else default
+
+
 def is_rope_parameters_nested(rope_parameters: dict[str, Any]) -> bool:
     """Check if rope_parameters is nested by layer types."""
     # Cannot be nested if rope_parameters is empty

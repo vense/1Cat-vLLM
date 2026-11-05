@@ -112,10 +112,16 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         cache_config = getattr(self.vllm_config, "cache_config", None)
         model_config = self.vllm_config.model_config
+        from vllm.transformers_utils.config import get_uniform_config_attr
+
         hf_text_config = getattr(model_config, "hf_text_config", None)
-        num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
-        num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
-        head_dim = getattr(hf_text_config, "head_dim", None)
+        num_attention_heads = get_uniform_config_attr(
+            hf_text_config, "num_attention_heads"
+        )
+        num_key_value_heads = get_uniform_config_attr(
+            hf_text_config, "num_key_value_heads"
+        )
+        head_dim = get_uniform_config_attr(hf_text_config, "head_dim")
         batch_context_shape_supported = (
             isinstance(num_attention_heads, int)
             and isinstance(num_key_value_heads, int)
