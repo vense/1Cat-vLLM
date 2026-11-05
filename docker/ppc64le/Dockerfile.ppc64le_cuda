@@ -1,0 +1,644 @@
+# CUDA-enabled 1Cat-vLLM Dockerfile for ppc64le (IBM AC922 / V100 sm_70) — 1Cat-vLLM v1.5.1
+#   https://github.com/1CatAI/1Cat-vLLM  (V100-focused vLLM fork; upstream ships only an x86_64 cu128 wheel)
+#
+#   - CUDA 12.4 (gpu1/gpu3 driver 550). 1Cat's CMakeLists keeps sm_70 for CUDA < 12.8; the
+#     >= 12.8 gates are sm_100/120 FP4/FP8 kernels. The cu128 torch pin in setup.py only fires
+#     when torch.version.cuda == "12.8".
+#   - llvm-triton + torch-builder: VERBATIM copy of vllm/0.19.1-torch2.10.0 (torch 2.10.0 /
+#     torchvision 0.25.0 / torchaudio 2.10.0, sm_70) so the BuildKit cache on gpu3 is reused.
+#     Editing those stages or passing MAX_JOBS rebuilds torch from source (hours).
+#   - base / xgrammar-builder / vllm-base: from vllm/0.32.0-torch2.13.0 (DevPI + Fury ppc64le wheels,
+#     xgrammar 0.2.8 + apache-tvm-ffi from source). 1Cat's requirements are close to vLLM 0.32's.
+#   - build: one full `setup.py bdist_wheel` (no precompiled split) so setup.py also builds and
+#     bundles 1Cat's SM70 kernels: flash-attention-v100, flash_qla sm70 GDN, flashinfer-sm70 H3.
+#   - Dropped (no ppc64le wheel): flashinfer, cutlass-dsl, quack, humming, cudnn-frontend, tilelang
+#     (only vllm/model_executor/kernels/mhc/tilelang_kernels.py uses it).
+#
+# Build: see build.sh (context ./vllm/, Dockerfile on stdin).
+
+ARG CUDA_VERSION=12.4.1
+ARG PYTHON_VERSION=3.12
+ARG TORCH_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCHAUDIO_VERSION=2.10.0
+ARG TRITON_VERSION=3.6.0
+# xgrammar structured-output kernel (0.2.x depends on apache-tvm-ffi); built from source
+ARG XGRAMMAR_VERSION=0.2.8
+ARG APACHE_TVM_FFI_VERSION=0.1.11
+# LLVM 15 from RHEL8 modular AppStream; full version pinned for reproducibility
+ARG LLVM_VER=15.0.7
+ARG GDRCOPY_VERSION=2.5.1
+ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubi8
+ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-runtime-ubi8
+# ppc64le prebuilt-wheel repositories (numpy/numba/opencv/pillow/llvmlite)
+ARG PIP_INDEX_DEVPI=https://wheels.developerfirst.ibm.com/ppc64le/linux/+simple/
+ARG PIP_INDEX_FURY=https://repo.fury.io/mgiessing/
+
+#################### LLVM FOR TRITON ####################
+# Triton needs a specific upstream LLVM commit (not system LLVM 15).
+# We run cmake directly (not Triton's build script) for ppc64le-specific flags.
+# Runs in parallel with torch-builder and base.
+FROM ${BUILD_BASE_IMAGE} AS llvm-triton
+
+ARG MAX_JOBS
+ARG PYTHON_VERSION
+ARG TRITON_VERSION
+
+RUN dnf install -y gcc-toolset-12 git cmake ninja-build python${PYTHON_VERSION} \
+  && dnf clean all
+
+# Clone Triton to get the LLVM commit hash it expects, then build LLVM/MLIR from source.
+# Overrides vs Triton's script: gcc (no clang), Release (saves ~30GB), no AMDGPU.
+RUN git clone https://github.com/triton-lang/triton.git -b v${TRITON_VERSION} --depth 1 /tmp/triton && \
+  LLVM_HASH=$(cat /tmp/triton/cmake/llvm-hash.txt) && \
+  git clone https://github.com/llvm/llvm-project.git /tmp/llvm-project && \
+  cd /tmp/llvm-project && git checkout ${LLVM_HASH} && \
+  rm -rf /tmp/triton && \
+  source /opt/rh/gcc-toolset-12/enable && \
+  cmake -G Ninja -B build -S llvm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld" \
+  -DLLVM_TARGETS_TO_BUILD="Native;NVPTX" \
+  -DLLVM_ENABLE_ASSERTIONS=ON \
+  -DLLVM_OPTIMIZED_TABLEGEN=ON \
+  -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+  -DLLVM_ENABLE_PIC=ON \
+  -DLLVM_ENABLE_RTTI=ON \
+  -DLLVM_INSTALL_UTILS=ON \
+  -DLLVM_EXTERNAL_LIT="" \
+  -DCMAKE_C_COMPILER=gcc \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_INSTALL_PREFIX=/opt/triton-llvm && \
+  ninja -C build -j ${MAX_JOBS:-$(nproc)} install && \
+  rm -rf /tmp/llvm-project
+
+#################### LLVM FOR TRITON ####################
+
+#################### TORCH BUILD IMAGE ####################
+# PyTorch must be built from source for ppc64le CUDA — no pip wheels exist.
+# This stage runs in parallel with other stages and produces wheels
+# that replace the pip-installed torch in base/csrc-build/build/vllm-base.
+FROM ${BUILD_BASE_IMAGE} AS torch-builder
+
+ARG PYTHON_VERSION
+ARG CUDA_VERSION
+
+# Install EPEL and enable CRB for dev packages
+RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm \
+  dnf-plugins-core && \
+  dnf config-manager --add-repo http://vault.centos.org/centos/8-stream/AppStream/ppc64le/os/ && \
+  dnf config-manager --add-repo http://vault.centos.org/centos/8-stream/PowerTools/ppc64le/os/ && \
+  echo "gpgcheck=0" >> /etc/yum.repos.d/vault.centos.org_centos_8-stream_AppStream_ppc64le_os_.repo && \
+  echo "gpgcheck=0" >> /etc/yum.repos.d/vault.centos.org_centos_8-stream_PowerTools_ppc64le_os_.repo
+
+
+RUN dnf install -y \
+  git tar curl wget unzip \
+  gcc-toolset-12 automake libtool \
+  openssl-devel \
+  libjpeg-turbo-devel zlib-devel libpng-devel libtiff-devel freetype-devel \
+  python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip \
+  && dnf clean all \
+  && python${PYTHON_VERSION} -m venv /opt/venv \
+  && /opt/venv/bin/python -m pip install -U pip uv setuptools
+
+ENV PATH="/opt/venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+
+# V100 (sm_70) only
+ENV USE_CUDA=1
+ENV USE_CUDNN=1
+ENV USE_NCCL=1
+ENV TORCH_CUDA_ARCH_LIST="7.0"
+ENV CMAKE_CUDA_ARCHITECTURES=70
+
+# Install cuDNN
+RUN dnf install -y libcudnn8 libcudnn8-devel
+
+# Build dependencies needed by PyTorch
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+  dnf install -y --allowerasing --nobest ccache openblas openblas-devel \
+  libcusparse-${CUDA_VERSION_DASH} libcusparse-devel-${CUDA_VERSION_DASH} \
+  lapack-devel
+
+ARG MAX_JOBS
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+
+# Build PyTorch
+RUN git clone --recursive https://github.com/pytorch/pytorch.git -b v${TORCH_VERSION}
+
+# uv fails to build lintrunner from source due to invalid pyproject.toml
+# Extract version from pytorch's requirements to stay in sync
+RUN LINTRUNNER_VER=$(grep -oP 'lintrunner==\K[0-9.]+' pytorch/requirements-lintrunner.txt || \
+  grep -oP 'lintrunner==\K[0-9.]+' pytorch/.lintrunner.toml || \
+  echo "0.13.0") && \
+  pip download lintrunner==${LINTRUNNER_VER} --no-binary lintrunner -d /tmp/lintrunner-sdist && \
+  tar -xzf /tmp/lintrunner-sdist/lintrunner-${LINTRUNNER_VER}.tar.gz -C /tmp/lintrunner-sdist/ && \
+  sed -i '/^\[project\]/a version = "'"${LINTRUNNER_VER}"'"' /tmp/lintrunner-sdist/lintrunner-${LINTRUNNER_VER}/pyproject.toml && \
+  uv pip install /tmp/lintrunner-sdist/lintrunner-${LINTRUNNER_VER} && \
+  rm -rf /tmp/lintrunner-sdist
+
+ENV USE_EIGEN_FOR_BLAS=0
+ENV USE_CUFILE=0
+
+RUN source /opt/rh/gcc-toolset-12/enable && \
+  cd pytorch && \
+  uv pip install -r requirements.txt && \
+  python setup.py develop && \
+  rm -f dist/torch*+git*whl && \
+  MAX_JOBS=${MAX_JOBS:-$(nproc)} \
+  PYTORCH_BUILD_VERSION=${TORCH_VERSION} PYTORCH_BUILD_NUMBER=1 \
+  uv build --wheel --out-dir /torchwheels/
+
+RUN uv pip install --upgrade setuptools wheel importlib-metadata
+
+# Build torchvision with CUDA
+RUN --mount=type=cache,target=/root/.cache/uv \
+  source /opt/rh/gcc-toolset-12/enable && \
+  # Downgrade setuptools as a workaround for "missing" pkg_resources
+  uv pip install --reinstall "setuptools==70.3.0" && \
+  git clone --recursive https://github.com/pytorch/vision.git -b v${TORCHVISION_VERSION} && \
+  cd vision && \
+  FORCE_CUDA=1 \
+  MAX_JOBS=${MAX_JOBS:-$(nproc)} \
+  BUILD_VERSION=${TORCHVISION_VERSION} \
+  uv build --wheel --out-dir /torchwheels/ --no-build-isolation
+
+# Build torchaudio
+RUN --mount=type=cache,target=/root/.cache/uv \
+  source /opt/rh/gcc-toolset-12/enable && \
+  git clone --recursive https://github.com/pytorch/audio.git -b v${TORCHAUDIO_VERSION} && \
+  cd audio && \
+  USE_CUDA=0 \
+  MAX_JOBS=${MAX_JOBS:-$(nproc)} \
+  BUILD_VERSION=${TORCHAUDIO_VERSION} \
+  uv build --wheel --out-dir /torchwheels/ --no-build-isolation
+
+#################### TORCH BUILD IMAGE ####################
+
+
+#################### BASE BUILD IMAGE ####################
+# prepare basic build environment
+FROM ${BUILD_BASE_IMAGE} AS base
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+
+# Install EPEL and enable CRB for dev packages
+RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+  dnf install -y dnf-plugins-core && \
+  dnf config-manager --add-repo http://vault.centos.org/centos/8-stream/AppStream/ppc64le/os/ && \
+  dnf config-manager --add-repo http://vault.centos.org/centos/8-stream/PowerTools/ppc64le/os/ && \
+  echo "gpgcheck=0" >> /etc/yum.repos.d/vault.centos.org_centos_8-stream_AppStream_ppc64le_os_.repo && \
+  echo "gpgcheck=0" >> /etc/yum.repos.d/vault.centos.org_centos_8-stream_PowerTools_ppc64le_os_.repo
+
+# Install system dependencies including build tools
+RUN dnf install -y --allowerasing --nobest \
+  ccache \
+  git \
+  curl \
+  sudo \
+  python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip \
+  rdma-core-devel \
+  gcc-toolset-12 \
+  gcc-toolset-12-libatomic-devel \
+  openssl-devel \
+  libjpeg-turbo-devel zlib-devel libpng-devel libtiff-devel freetype-devel \
+  openblas openblas-devel \
+  # rpm-build: needed to build gdrcopy RPM
+  rpm-build \
+  && dnf clean all \
+  && curl -LsSf https://astral.sh/uv/install.sh | sh \
+  && $HOME/.local/bin/uv venv /opt/venv --python ${PYTHON_VERSION} \
+  && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
+  && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
+  && ln -sf /opt/venv/bin/pip /usr/bin/pip
+
+# Install cuDNN (separate layer due to size)
+RUN dnf install -y libcudnn8 libcudnn8-devel
+
+# LLVM 15 (needed to build llvmlite; Triton statically links its own LLVM)
+ARG LLVM_VER
+RUN dnf install -y \
+  llvm-${LLVM_VER} \
+  llvm-devel-${LLVM_VER} \
+  llvm-libs-${LLVM_VER} \
+  clang-${LLVM_VER} \
+  clang-libs-${LLVM_VER}
+
+# Activate virtual environment and add uv to PATH
+ENV PATH="/opt/venv/bin:/root/.local/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+
+RUN uv pip install -U pip setuptools wheel pybind11 cmake
+
+# Environment for uv
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE=copy
+
+# ppc64le wheel indexes (re-declared from global ARGs). UV_EXTRA_INDEX_URL makes
+# every `uv pip install` in this stage (and children) resolve ppc64le wheels for
+# numpy/numba/opencv/pillow/llvmlite from DevPI + Fury instead of source-building.
+ARG PIP_INDEX_DEVPI
+ARG PIP_INDEX_FURY
+ENV UV_EXTRA_INDEX_URL="${PIP_INDEX_DEVPI} ${PIP_INDEX_FURY}"
+
+# Verify GCC version
+RUN source /opt/rh/gcc-toolset-12/enable && gcc --version
+
+# Install Rust compiler (needed to build tiktoken from source, no ppc64le wheel)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+  dnf install -y cmake pkg-config
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# V100 (sm_70) only
+ENV TORCH_CUDA_ARCH_LIST="7.0"
+ENV CMAKE_CUDA_ARCHITECTURES=70
+
+# ============================================================
+# SLOW-CHANGING DEPENDENCIES BELOW
+# These are the expensive layers that we want to cache
+# ============================================================
+
+# Install PyTorch from source-built wheels (no ppc64le CUDA pip wheels)
+# Then install remaining cuda.txt deps, filtering out torch and ppc64le-incompatible packages
+WORKDIR /workspace
+
+COPY requirements/common.txt requirements/common.txt
+COPY requirements/cuda.txt requirements/cuda.txt
+COPY use_existing_torch.py use_existing_torch.py
+COPY pyproject.toml pyproject.toml
+
+# numpy / numba / llvmlite / opencv-python-headless / pillow are NOT source-built
+# anymore — they are pulled as prebuilt ppc64le wheels from DevPI + Fury
+# (UV_EXTRA_INDEX_URL) during the requirements install below. This is the main
+# simplification over the 0.19.x harness (ppc64le source builds were fragile).
+
+# Build packages from source (no ppc64le wheels on PyPI)
+# Rust is needed for llguidance. Version specs from requirements/common.txt ensure built
+# wheels satisfy constraints and won't be overwritten by PyPI binaries in vllm-base.
+RUN source /opt/rh/gcc-toolset-12/enable && \
+  PYZMQ_SPEC=$(grep '^pyzmq' requirements/common.txt | sed 's/;.*//') && \
+  LLGUIDANCE_SPEC=$(grep '^llguidance' requirements/common.txt | sed 's/;.*//') && \
+  pip3 wheel --no-binary psutil,pyzmq,llguidance --no-deps \
+  psutil msgspec "$PYZMQ_SPEC" "$LLGUIDANCE_SPEC" \
+  --wheel-dir /precompiled-wheels/
+
+# Pre-build vllm-openai dependencies (avoids needing compilers in final image)
+RUN source /opt/rh/gcc-toolset-12/enable && \
+  pip3 wheel --no-deps \
+  accelerate hf_transfer modelscope bitsandbytes \
+  --wheel-dir /precompiled-wheels/
+
+# Build gdrcopy RPM from source (prebuilt .deb only available for x86/arm64)
+ARG GDRCOPY_VERSION
+RUN git clone https://github.com/NVIDIA/gdrcopy.git -b v${GDRCOPY_VERSION} /tmp/gdrcopy && \
+  source /opt/rh/gcc-toolset-12/enable && \
+  cd /tmp/gdrcopy/packages && \
+  CUDA=/usr/local/cuda ./build-rpm-packages.sh && \
+  mkdir -p /gdrcopy-rpms && \
+  cp /tmp/gdrcopy/packages/*.rpm /gdrcopy-rpms/ && \
+  rm -rf /tmp/gdrcopy
+
+# Build Triton from source (no ppc64le wheels on PyPI)
+# Required for TRITON_ATTN attention backend on sm_70 (V100)
+# LLVM/MLIR built from source in the llvm-triton stage (Triton needs a specific commit)
+ARG TRITON_VERSION
+RUN --mount=type=bind,from=llvm-triton,source=/opt/triton-llvm,target=/opt/triton-llvm,ro \
+  source /opt/rh/gcc-toolset-12/enable && \
+  git clone https://github.com/triton-lang/triton.git -b v${TRITON_VERSION} /tmp/triton && \
+  cd /tmp/triton && \
+  # Remove AMDGPU/ROCDL dependencies — we only build LLVM with Native;NVPTX
+  sed -i \
+  -e '/MLIRAMDGPUDialect/d' \
+  -e '/MLIRROCDLToLLVMIRTranslation/d' \
+  -e '/MLIRGPUToROCDLTransforms/d' \
+  -e '/LLVMAMDGPUCodeGen/d' \
+  -e '/LLVMAMDGPUAsmParser/d' \
+  CMakeLists.txt && \
+  # ppc64le LLVM lib list omits LLVMMIRParser, leaving llvm::createMIRParser
+  # undefined in libtriton.so (fails to import). Link it explicitly (placed last
+  # so it satisfies references from the other LLVM libs).
+  sed -i '/LLVMPowerPCCodeGen/a\        LLVMMIRParser' CMakeLists.txt && \
+  LLVM_SYSPATH=/opt/triton-llvm \
+  TRITON_PTXAS_PATH=$(which ptxas) \
+  TRITON_PTXAS_BLACKWELL_PATH=$(which ptxas) \
+  TRITON_CUOBJDUMP_PATH=$(which cuobjdump) \
+  TRITON_NVDISASM_PATH=$(which nvdisasm) \
+  TRITON_CUDACRT_PATH=/usr/local/cuda/include \
+  TRITON_CUDART_PATH=/usr/local/cuda/include \
+  TRITON_CUPTI_INCLUDE_PATH=/usr/local/cuda/include \
+  TRITON_CUPTI_LIB_PATH=/usr/local/cuda/lib64 \
+  pip3 wheel . --no-deps --wheel-dir /precompiled-wheels/ && \
+  rm -rf /tmp/triton
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+  --mount=type=bind,from=torch-builder,source=/torchwheels/,target=/torchwheels/,ro \
+  source /opt/rh/gcc-toolset-12/enable && \
+  # grpcio: use system OpenSSL instead of bundled BoringSSL (build fails on ppc64le)
+  export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 && \
+  uv pip install /torchwheels/torch-*.whl /torchwheels/torchvision-*.whl /torchwheels/torchaudio-*.whl && \
+  python3 use_existing_torch.py --prefix && \
+  # Drop GPU-kernel / codec packages with no ppc64le (or no sm_70) wheels. These are
+  # optional accelerators on x86/sm_90; vLLM runs on V100 with the TRITON_ATTN backend.
+  #   flashinfer / nvidia-cutlass-dsl / quack-kernels / humming-kernels / tilelang
+  #     / tokenspeed-mla / instanttensor : FA4/CuteDSL/MSA kernels, sm_75+ or x86-only
+  #   PyNvVideoCodec / torchcodec : NVIDIA video codecs, no ppc64le wheel
+  #   nvtx / nvidia-cudnn-frontend : no ppc64le wheel (profiling / cudnn headers)
+  #   apache-tvm-ffi : built in xgrammar-builder (needs `make`, absent at runtime)
+  sed -i \
+  -e '/^flashinfer/d' \
+  -e '/^nvidia-cudnn-frontend/d' \
+  -e '/^nvidia-cutlass-dsl/d' \
+  -e '/^quack-kernels/d' \
+  -e '/^humming-kernels/d' \
+  -e '/^tilelang/d' \
+  -e '/^tokenspeed-mla/d' \
+  -e '/^instanttensor/d' \
+  -e '/^PyNvVideoCodec/d' \
+  -e '/^nvtx/d' \
+  -e '/^apache-tvm-ffi/d' \
+  -e '/^torchcodec/d' \
+  requirements/cuda.txt && \
+  # opencv/numpy/pillow come from DevPI; xgrammar is built in xgrammar-builder.
+  # Pin opencv to the ppc64le DevPI build (avoid resolving to opencv 5.x).
+  sed -i \
+  -e '/^xgrammar/d' \
+  -e 's/^opencv-python-headless.*/opencv-python-headless == 4.13.0.92/' \
+  requirements/common.txt && \
+  uv pip install -r requirements/cuda.txt
+
+#################### BASE BUILD IMAGE ####################
+
+#################### XGRAMMAR BUILD IMAGE ####################
+# xgrammar structured-output kernel. 0.2.x depends on apache-tvm-ffi, whose bundled
+# libbacktrace needs `make` to compile — present here, absent in the runtime image —
+# so we build both wheels here and install them with --no-deps at runtime.
+# Recipe mirrors upstream docker/build_vllm_ppc64le.sh (POWER9: -fno-lto -mcpu=power9).
+FROM base AS xgrammar-builder
+
+ARG XGRAMMAR_VERSION
+ARG APACHE_TVM_FFI_VERSION
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+  --mount=type=bind,from=torch-builder,source=/torchwheels/,target=/torchwheels/,ro \
+  source /opt/rh/gcc-toolset-12/enable && \
+  dnf install -y make ninja-build && \
+  uv pip install /torchwheels/torch-*.whl && \
+  uv pip install scikit-build-core==0.11.6 "pyproject-metadata<0.8" pathspec \
+  packaging distro setuptools_scm cmake ninja pybind11 nanobind && \
+  export CFLAGS="-fno-lto -mcpu=power9" CXXFLAGS="-fno-lto -mcpu=power9" LDFLAGS="-fno-lto" && \
+  # apache-tvm-ffi: build wheel from sdist (no ppc64le wheel on PyPI)
+  pip3 wheel apache-tvm-ffi==${APACHE_TVM_FFI_VERSION} --no-deps --wheel-dir /xgrammarwheels/ && \
+  uv pip install /xgrammarwheels/apache_tvm_ffi*.whl && \
+  git clone --recursive https://github.com/mlc-ai/xgrammar.git \
+  -b v${XGRAMMAR_VERSION} /tmp/xgrammar && \
+  cd /tmp/xgrammar && \
+  cp cmake/config.cmake . && \
+  uv build --wheel --out-dir /xgrammarwheels/ --no-build-isolation && \
+  rm -rf /tmp/xgrammar
+
+#################### XGRAMMAR BUILD IMAGE ####################
+
+#################### WHEEL BUILD IMAGE ####################
+# One full build: CMake extensions (_C, _moe_C, flashinfer-sm70 H3, ...) + setup.py's SM70 bundles
+# (flash-attention-v100 build_ext, flash_qla sm70 GDN via torch cpp_extension) + optional Rust
+# frontend (vllm-rs; setuptools-rust marks it optional unless VLLM_REQUIRE_RUST_FRONTEND is set).
+FROM base AS build
+
+# The vLLM 0.32-era host code needs GCC >= 13 (C++20 <format>); nvcc 12.4 accepts gcc 13.
+RUN dnf install -y gcc-toolset-13 gcc-toolset-13-libatomic-devel && dnf clean all
+
+COPY requirements/build/cuda.txt requirements/build.txt
+COPY use_existing_torch.py use_existing_torch.py
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+  python3 use_existing_torch.py --prefix && \
+  uv pip install -r requirements/build.txt
+
+WORKDIR /workspace
+COPY . .
+
+ARG max_jobs=160
+ENV MAX_JOBS=${max_jobs}
+ARG nvcc_threads=1
+ENV NVCC_THREADS=$nvcc_threads
+ENV CMAKE_CUDA_ARCHITECTURES=70
+ENV TORCH_CUDA_ARCH_LIST="7.0"
+ENV FLASH_ATTN_V100_CUDA_ARCH_LIST="7.0"
+ENV VLLM_TARGET_DEVICE=cuda
+ENV CCACHE_DIR=/root/.cache/ccache
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+  --mount=type=cache,target=/root/.cache/uv \
+  --mount=type=bind,source=.git,target=.git \
+  source /opt/rh/gcc-toolset-13/enable && \
+  rm -rf .deps build dist && mkdir -p .deps && \
+  export VLLM_DOCKER_BUILD_CONTEXT=1 && \
+  python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 && \
+  ls -la dist && \
+  python3 -c "import zipfile,glob; n=zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); \
+print([x for x in n if x.endswith('.so')])"
+
+#################### WHEEL BUILD IMAGE ####################
+
+#################### vLLM installation IMAGE ####################
+# image with vLLM installed
+FROM ${FINAL_BASE_IMAGE} AS vllm-base
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+
+WORKDIR /vllm-workspace
+
+# Install EPEL and enable CRB
+RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+    dnf install -y dnf-plugins-core && \
+    dnf config-manager --add-repo http://vault.centos.org/centos/8-stream/AppStream/ppc64le/os/ && \
+    dnf config-manager --add-repo http://vault.centos.org/centos/8-stream/PowerTools/ppc64le/os/ && \
+    echo "gpgcheck=0" >> /etc/yum.repos.d/vault.centos.org_centos_8-stream_AppStream_ppc64le_os_.repo && \
+    echo "gpgcheck=0" >> /etc/yum.repos.d/vault.centos.org_centos_8-stream_PowerTools_ppc64le_os_.repo
+
+RUN dnf install -y --allowerasing --nobest \
+    curl \
+    git \
+    openblas \
+    python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip \
+    rdma-core-devel \
+    llvm-libs \
+    && dnf clean all
+
+RUN dnf install -y --allowerasing --nobest \
+    libtiff libwebp libjpeg-turbo openjpeg2 libimagequant lcms2 freetype libraqm libxcb \
+    && dnf clean all
+
+# 1Cat's serve_*_v100.sh runs $(dirname $(command -v vllm))/python = /usr/local/bin/python, so provide it.
+RUN ln -sf /usr/bin/python${PYTHON_VERSION} /usr/bin/python3 \
+  && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
+  && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python
+
+# Install CUDA development tools for runtime JIT compilation (Triton kernels)
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+  dnf install -y \
+  cuda-nvcc-${CUDA_VERSION_DASH} \
+  cuda-cudart-devel-${CUDA_VERSION_DASH} \
+  cuda-nvrtc-${CUDA_VERSION_DASH} \
+  cuda-cuobjdump-${CUDA_VERSION_DASH} \
+  libcurand-devel-${CUDA_VERSION_DASH} \
+  libcublas-${CUDA_VERSION_DASH} \
+  libnccl-devel && \
+  dnf clean all
+
+# cuDNN and CUPTI runtime libraries
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+  dnf install -y libcudnn8 cuda-cupti-${CUDA_VERSION_DASH} && \
+  dnf clean all
+
+# LLVM 15 (needed by llvmlite at runtime)
+# Multimodal runtime deps already installed above.
+ARG LLVM_VER
+RUN dnf install -y llvm-libs-${LLVM_VER} && dnf clean all
+
+# Install uv for faster pip installs
+RUN python3 -m pip install uv
+
+# Environment for uv
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE=copy
+
+# ppc64le wheel indexes (re-declared from global ARGs) — numpy/numba/opencv/pillow
+# come from here at runtime.
+ARG PIP_INDEX_DEVPI
+ARG PIP_INDEX_FURY
+ENV UV_EXTRA_INDEX_URL="${PIP_INDEX_DEVPI} ${PIP_INDEX_FURY}"
+
+# V100 (sm_70) only
+ENV TORCH_CUDA_ARCH_LIST="7.0"
+ENV CMAKE_CUDA_ARCHITECTURES=70
+
+# ============================================================
+# SLOW-CHANGING DEPENDENCIES BELOW
+# These are the expensive layers that we want to cache
+# ============================================================
+
+# Install PyTorch from source-built wheels, then remaining cuda.txt deps.
+# numpy / numba / opencv / pillow / llvmlite resolve from DevPI + Fury (UV_EXTRA_INDEX_URL).
+# /precompiled-wheels/ holds the source-built wheels from the base stage
+# (psutil, msgspec, pyzmq, llguidance, accelerate, hf_transfer, modelscope, bitsandbytes, triton).
+COPY requirements/common.txt /tmp/common.txt
+COPY requirements/cuda.txt /tmp/requirements-cuda.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+  --mount=type=bind,from=torch-builder,source=/torchwheels/,target=/torchwheels/,ro \
+  --mount=type=bind,from=base,source=/precompiled-wheels/,target=/precompiled-wheels/,ro \
+  uv pip install --system \
+  /torchwheels/torch-*.whl \
+  /torchwheels/torchvision-*.whl \
+  /torchwheels/torchaudio-*.whl \
+  /precompiled-wheels/*.whl \
+  && \
+  # cv2/typing shadows stdlib typing module causing circular import in multiprocessing
+  rm -rf /usr/local/lib64/python${PYTHON_VERSION}/site-packages/cv2/typing && \
+  sed -i \
+  -e '/^torch/d' \
+  -e '/^torchvision/d' \
+  -e '/^torchaudio/d' \
+  -e '/^torchcodec/d' \
+  -e '/^flashinfer/d' \
+  -e '/^nvidia-cudnn-frontend/d' \
+  -e '/^nvidia-cutlass-dsl/d' \
+  -e '/^quack-kernels/d' \
+  -e '/^humming-kernels/d' \
+  -e '/^tilelang/d' \
+  -e '/^tokenspeed-mla/d' \
+  -e '/^instanttensor/d' \
+  -e '/^PyNvVideoCodec/d' \
+  -e '/^nvtx/d' \
+  -e '/^apache-tvm-ffi/d' \
+  /tmp/requirements-cuda.txt && \
+  # xgrammar is installed from the wheel built in xgrammar-builder (below);
+  # pin opencv to the ppc64le DevPI build. numpy/pillow resolve from DevPI.
+  sed -i \
+  -e '/^xgrammar/d' \
+  -e 's/^opencv-python-headless.*/opencv-python-headless == 4.13.0.92/' \
+  /tmp/common.txt && \
+  uv pip install --system -r /tmp/requirements-cuda.txt && \
+  # timm: required by vision models (e.g. Gemma 3n) for vision tower components
+  uv pip install --system timm && \
+  rm /tmp/requirements-cuda.txt /tmp/common.txt
+
+# xgrammar (+ apache-tvm-ffi) from source-built wheels (1Cat needs no xformers).
+# --no-deps: all transitive deps already satisfied above; avoids pulling x86-only extras.
+RUN --mount=type=bind,from=xgrammar-builder,source=/xgrammarwheels/,target=/xgrammarwheels/,ro \
+  uv pip install --system --no-deps \
+  /xgrammarwheels/apache_tvm_ffi*.whl \
+  /xgrammarwheels/xgrammar*.whl
+
+# FlashInfer: skipped (requires sm_75+, V100 is sm_70). Attention backend: TRITON_ATTN.
+
+# Install gdrcopy from pre-built RPM (built in base stage)
+RUN --mount=type=bind,from=base,source=/gdrcopy-rpms/,target=/gdrcopy-rpms/,ro \
+  rpm -iv /gdrcopy-rpms/gdrcopy-[0-9]*.rpm && \
+  ldconfig
+
+# ============================================================
+# VLLM INSTALLATION (depends on build stage)
+# ============================================================
+
+# Install the 1Cat-vLLM wheel (package 1cat-vllm, module vllm; bundles flash_attn_v100 and flash_qla sm70)
+RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+  --mount=type=cache,target=/root/.cache/uv \
+  ls dist/*.whl && \
+  # All deps already installed from requirements above
+  uv pip install --system dist/*.whl --no-deps --verbose
+
+# Add hf_xet without moving 1Cat's pins (no --upgrade: in vllm 0.32 that pulled numpy 2.5,
+# which breaks numba and mistral-common). bitsandbytes has no ppc64le CUDA library, so drop it.
+RUN uv pip install --system hf_xet && \
+  uv pip uninstall --system bitsandbytes
+
+# 1Cat's torch 2.10.0 backport (AOT-compile Triton side table, upstream in 2.11). apply.sh checks
+# the file hash; the source-built torch should match pristine 2.10.0. Warn instead of failing.
+COPY tools/torch_patches /tmp/torch_patches
+RUN dnf install -y patch && dnf clean all && \
+  (bash /tmp/torch_patches/apply.sh python3 || echo "WARNING: torch backport not applied") && \
+  rm -rf /tmp/torch_patches
+
+# Fail the build on dependency conflicts or broken core imports. Packages dropped on purpose
+# (flashinfer, tilelang, ...) only show up as "not installed" and are ignored.
+# 1Cat pins apache-tvm-ffi==0.1.10 only for tilelang (dropped here); xgrammar 0.2.8 needs >= 0.1.11.
+RUN ! python3 -m pip check | grep -v -e "which is not installed" -e "No broken requirements" \
+    -e "requirement apache-tvm-ffi==0.1.10, but you have apache-tvm-ffi 0.1.11" && \
+  python3 -c "import numba, numpy, torch, triton, xgrammar, transformers, vllm, flash_attn_v100; numba.njit(lambda a: a + 1)(1)"
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV CPATH=/usr/local/cuda/include
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+# Triton finds ptxas via its own env var, not $PATH
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+# Attention backend auto-selects to TRITON_ATTN on V100 (sm_70): FlashAttn needs sm_80+
+# and the XFORMERS backend was removed upstream in v0.12.0 (PR #29262), so there is no
+# VLLM_ATTENTION_BACKEND override to set here.
+# flashinfer has no ppc64le/sm_70 wheel (filtered out), but the sampler's capability
+# probe hard-imports it and crashes engine init — disable the flashinfer sampler path.
+ENV VLLM_USE_FLASHINFER_SAMPLER=0
+
+# Copy examples and benchmarks at the end to minimize cache invalidation
+COPY examples examples
+COPY benchmarks benchmarks
+COPY ./vllm/collect_env.py .
+#################### vLLM installation IMAGE ####################
+
+#################### OPENAI API SERVER ####################
+FROM vllm-base AS vllm-openai
+
+ENV VLLM_USAGE_SOURCE production-docker-image
+
+
+ENTRYPOINT ["vllm", "serve"]
+#################### OPENAI API SERVER ####################
