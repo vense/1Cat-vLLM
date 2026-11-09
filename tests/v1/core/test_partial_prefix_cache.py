@@ -71,6 +71,21 @@ def test_eviction_releases_block_references():
     assert pool.get_num_free_blocks() == free_before
 
 
+def test_snapshot_demand_checks_aggregate_free_blocks():
+    # An unpartitioned pool passes every group quota check, so the snapshot
+    # copy must also fit in the pool's aggregate free blocks. Before this check
+    # a hybrid model (attention + Mamba groups) asked for one block per group
+    # with one block left and EngineCore died in get_new_blocks.
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
+    manager = SimpleNamespace(block_pool=pool)
+    pool.get_new_blocks(pool.get_num_free_blocks() - 1)
+    assert pool.can_allocate_group_blocks({0: 1, 1: 1})
+    assert not KVCacheManager._can_allocate_snapshot_blocks(manager, {0: 1, 1: 1})
+    assert KVCacheManager._can_allocate_snapshot_blocks(manager, {0: 1})
+
+
 def _request(boundaries):
     return Request(
         request_id="r",

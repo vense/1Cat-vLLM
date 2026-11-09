@@ -374,7 +374,7 @@ class KVCacheManager:
                     [self.block_pool.null_block] * first + entry.blocks[group_id]
                 )
         demand = {group_id: 1 for group_id, copy in enumerate(entry.copy_last) if copy}
-        if not self.block_pool.can_allocate_group_blocks(demand):
+        if not self._can_allocate_snapshot_blocks(demand):
             return None
         request.partial_prefix_entry = entry
         return tuple(blocks), boundary
@@ -430,10 +430,10 @@ class KVCacheManager:
             if len(sources) != len(managers):
                 continue
             demand = {g: len(blocks) for g, blocks in enumerate(sources)}
-            while not self.block_pool.can_allocate_group_blocks(demand):
+            while not self._can_allocate_snapshot_blocks(demand):
                 if not cache.evict_one():
                     break
-            if not self.block_pool.can_allocate_group_blocks(demand):
+            if not self._can_allocate_snapshot_blocks(demand):
                 continue
             targets: list[list[KVCacheBlock]] = []
             for group_id, group_sources in enumerate(sources):
@@ -952,6 +952,19 @@ class KVCacheManager:
                     (group_id, block.block_id, boundary_tokens)
                 )
         return offloads
+
+    def _can_allocate_snapshot_blocks(self, demand: dict[int, int]) -> bool:
+        """Whether the pool can hand out `demand` blocks per KV cache group.
+
+        `BlockPool.can_allocate_group_blocks` only checks the partition quotas
+        and returns True for an unpartitioned pool; its callers must check the
+        aggregate free capacity themselves. Partial prefix snapshots copy whole
+        blocks outside the scheduler's admission check, so check both here.
+        Otherwise `get_new_blocks` raises when the pool is nearly full.
+        """
+        return sum(demand.values()) <= self.block_pool.get_num_free_blocks() and (
+            self.block_pool.can_allocate_group_blocks(demand)
+        )
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
