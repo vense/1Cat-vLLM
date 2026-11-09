@@ -919,24 +919,17 @@ def get_pooling_config(
 
     logger.info("Found sentence-transformers modules configuration.")
 
+    # sentence-transformers < 5 names modules "sentence_transformers.models.Pooling";
+    # 5.x uses e.g. "sentence_transformers.sentence_transformer.modules.pooling.Pooling".
+    # Match on the class name so both layouts are recognized.
+    def _module_class(item: dict[str, Any]) -> str:
+        return str(item.get("type", "")).rsplit(".", 1)[-1]
+
     pooling = next(
-        (
-            item
-            for item in modules_dict
-            if item["type"] == "sentence_transformers.models.Pooling"
-        ),
+        (item for item in modules_dict if _module_class(item) == "Pooling"),
         None,
     )
-    normalize = bool(
-        next(
-            (
-                item
-                for item in modules_dict
-                if item["type"] == "sentence_transformers.models.Normalize"
-            ),
-            False,
-        )
-    )
+    normalize = any(_module_class(item) == "Normalize" for item in modules_dict)
 
     if pooling:
         from vllm.config.pooler import SEQ_POOLING_TYPES, TOK_POOLING_TYPES
@@ -947,6 +940,21 @@ def get_pooling_config(
         logger.info("Found pooling configuration.")
 
         config: dict[str, Any] = {"use_activation": normalize}
+        # sentence-transformers 5.x writes the mode as a string
+        # ({"pooling_mode": "mean"}) instead of one boolean flag per mode.
+        if isinstance(mode := pooling_dict.get("pooling_mode"), str):
+            pooling_type = parse_pooling_type(mode)
+            if pooling_type in SEQ_POOLING_TYPES:
+                config["seq_pooling_type"] = pooling_type
+            elif pooling_type in TOK_POOLING_TYPES:
+                config["tok_pooling_type"] = pooling_type
+            else:
+                logger.warning("Unsupported sentence-transformers pooling_mode %r", mode)
+        if pooling_dict.get("include_prompt") is False:
+            logger.warning(
+                "sentence-transformers pooling with include_prompt=false is not "
+                "supported; prompt tokens are pooled as well."
+            )
         for key, val in pooling_dict.items():
             if val is True:
                 pooling_type = parse_pooling_type(key)

@@ -40,6 +40,16 @@ class FlashAttnV100Backend(TritonAttentionBackend):
         return TritonAttentionBackend.get_supported_kernel_block_sizes()
 
     @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        # The Flash-V100 forward only runs decoder self-attention; encoder,
+        # encoder-only and cross-attention layers raise "cannot run this
+        # layer/config". TritonAttentionBackend accepts every type, so do not
+        # inherit that: backend selection then picks TRITON_ATTN for them.
+        from vllm.v1.attention.backend import AttentionType
+
+        return attn_type == AttentionType.DECODER
+
+    @classmethod
     def supports_non_causal(cls) -> bool:
         # D-Flash uses non-causal decoder attention over the draft query
         # tokens. The V100 backend handles this in the prefill paths by

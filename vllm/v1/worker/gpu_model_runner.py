@@ -5032,6 +5032,10 @@ class GPUModelRunner(
         profile_inner_t0 = time.perf_counter() if profile_inputs else 0.0
         for group_id, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             kv_cache_spec = kv_cache_group.kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                # Encoder-only layers keep no KV cache and get no block table
+                # (see _get_block_table / _get_slot_mapping).
+                continue
             is_circular = isinstance(kv_cache_spec, CircularBufferSpec)
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 is_circular = all(
